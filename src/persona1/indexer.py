@@ -10,10 +10,11 @@ nltk.download('stopwords')
 nltk.download('punkt_tab')
 
 # Cargar el corpus
-df = pd.read_csv("ModApte_test.csv")
+df = pd.read_csv("../../ModApte_test.csv")
 
 # Eliminar filas con texto nulo
 df = df.dropna(subset=['text'])
+df["doc_id"] = df["new_id"].astype(str).str.strip('"').str.strip()
 print(f"Documentos después de limpiar nulos: {len(df)}")
 
 # Preprocesamiento
