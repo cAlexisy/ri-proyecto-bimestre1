@@ -1,5 +1,4 @@
 ﻿ModApte_test.csv
-data/
 __pycache__/
 *.pyc
 .env
