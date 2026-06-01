@@ -1,0 +1,10 @@
+﻿Q1 oil prices
+Q2 japan trade
+Q3 interest rates
+Q4 stock market
+Q5 grain exports
+Q6 dollar exchange
+Q7 economic growth
+Q8 coffee prices
+Q9 bank loans
+Q10 energy demand
