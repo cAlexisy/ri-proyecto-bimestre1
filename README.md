@@ -34,7 +34,7 @@ sobre el corpus Reuters-21578 (ModApte split):
 ---
 
 ## Requisitos
-- Python 3.11
+- Python 3.11+
 - pip
 
 ---
@@ -73,11 +73,11 @@ Linux/Mac:
     cd core
     python cli.py
 
-El sistema solicitará:
-1. **Consulta** — texto libre en inglés, por ejemplo: oil prices
-2. **Modelo** — uno de: tfidf | bm25 | jaccard | embeddings
+Escribe tu consulta en texto libre. Las búsquedas usan recuperación semántica (ChromaDB).
 
-Para salir escribe salir.
+Comandos especiales:
+- `evaluar` — evalúa los 4 modelos con qrels y muestra Precision@k, Recall@k y MAP
+- `salir` — termina el programa
 
 ### Notebook completo
 Abrir core/tfidf_bm25.ipynb en Jupyter o VS Code y ejecutar todas las celdas en orden.

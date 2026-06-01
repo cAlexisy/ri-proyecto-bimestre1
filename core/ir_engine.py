@@ -1,233 +1,219 @@
+import re
+import math
+import string
 import pandas as pd
 import nltk
-import string
-import math
+import chromadb
 from nltk.tokenize import word_tokenize
 from nltk.corpus import stopwords
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-from collections import defaultdict
+from collections import defaultdict, Counter
+from sentence_transformers import SentenceTransformer
 
-# Descarga silenciosa de recursos NLTK necesarios para tokenización y stopwords
-nltk.download('punkt', quiet=True)
+nltk.download('punkt',     quiet=True)
 nltk.download('stopwords', quiet=True)
 nltk.download('punkt_tab', quiet=True)
 
-# ── Carga del corpus ───────────────────────────────────────────────────────────
-# Se lee el CSV del corpus Reuters-21578 desde la carpeta data/
+# ── Corpus ────────────────────────────────────────────────────────────────────
 df = pd.read_csv("../data/ModApte_test.csv")
-
-# Eliminar filas que no tienen texto
 df = df.dropna(subset=['text'])
-
-# Resetear índices para que sean consecutivos desde 0
 df = df.reset_index(drop=True)
 
-# ── Preprocesamiento ───────────────────────────────────────────────────────────
-# Cargar lista de stopwords en inglés
+# ── Preprocesamiento ──────────────────────────────────────────────────────────
 stop_words = set(stopwords.words('english'))
 
 def preprocess(text):
-    """
-    Limpia y tokeniza un texto aplicando:
-    - Conversión a minúsculas
-    - Tokenización por palabras
-    - Eliminación de puntuación y stopwords
-    - Eliminación de tokens cortos (menos de 3 caracteres)
-    """
-    # Convertir a minúsculas
-    text = text.lower()
-
-    # Tokenizar el texto en palabras individuales
-    tokens = word_tokenize(text)
-
-    # Limpiar cada token: quitar puntos, guiones y filtrar stopwords y tokens cortos
+    """Minusculas -> tokenizar -> quitar puntuacion/stopwords/tokens cortos."""
+    tokens = word_tokenize(text.lower())
     tokens = [
         t.replace('.', '').replace('-', ' ').strip()
         for t in tokens
-        if t not in string.punctuation
-        and t not in stop_words
-        and len(t) > 2
+        if t not in string.punctuation and t not in stop_words and len(t) > 2
     ]
-
-    # Eliminar tokens que quedaron vacíos después del reemplazo
     return [t for t in tokens if t]
 
-# Aplicar preprocesamiento a todos los documentos del corpus
-df['tokens'] = df['text'].apply(preprocess)
-
-# Unir tokens en un string para usar con TfidfVectorizer
+df['tokens']    = df['text'].apply(preprocess)
 df['processed'] = df['tokens'].apply(lambda t: ' '.join(t))
 
-# ── Modelo TF-IDF ──────────────────────────────────────────────────────────────
-# Crear y entrenar el vectorizador TF-IDF sobre el corpus completo
-vectorizer = TfidfVectorizer()
+# ── Indice invertido ──────────────────────────────────────────────────────────
+# term -> {doc_id: frecuencia}
+inverted_index = defaultdict(dict)
+doc_len        = {}
+
+for i, tokens in enumerate(df['tokens']):
+    counts     = Counter(tokens)
+    doc_len[i] = sum(counts.values())
+    for term, freq in counts.items():
+        inverted_index[term][i] = freq
+
+doc_freq = {term: len(postings) for term, postings in inverted_index.items()}
+N        = len(df)
+avgdl    = sum(doc_len.values()) / N
+
+# ── TF-IDF + coseno ───────────────────────────────────────────────────────────
+vectorizer   = TfidfVectorizer()
 tfidf_matrix = vectorizer.fit_transform(df['processed'])
 
 def search_tfidf_cosine(query, top_k=10):
-    """
-    Recupera documentos usando TF-IDF + similitud coseno.
-    - Vectoriza la consulta con el mismo vectorizador del corpus
-    - Calcula similitud coseno entre la consulta y todos los documentos
-    - Retorna los top_k documentos más similares
-    """
-    # Preprocesar y vectorizar la consulta
-    query_vec = vectorizer.transform([' '.join(preprocess(query))])
-
-    # Calcular similitud coseno con todos los documentos
-    scores = cosine_similarity(query_vec, tfidf_matrix).flatten()
-
-    # Ordenar por score descendente
+    """TF-IDF + similitud coseno."""
+    q_vec  = vectorizer.transform([' '.join(preprocess(query))])
+    scores = cosine_similarity(q_vec, tfidf_matrix).flatten()
     ranked = sorted(enumerate(scores), key=lambda x: x[1], reverse=True)
+    return [(doc_id, s) for doc_id, s in ranked[:top_k] if s > 0]
 
-    # Retornar solo documentos con score mayor a 0
-    return [(doc_id, score) for doc_id, score in ranked[:top_k] if score > 0]
+# ── BM25 (usa indice invertido) ───────────────────────────────────────────────
+def search_bm25(query, top_k=10, k1=1.5, b=0.75):
+    """BM25 con indice invertido — no itera sobre todos los documentos."""
+    freq_q = Counter(preprocess(query))
+    scores = defaultdict(float)
 
-# ── Modelo BM25 ────────────────────────────────────────────────────────────────
-# Parámetros del modelo BM25
-N = len(df)                                    # Total de documentos
-avgdl = df['tokens'].apply(len).mean()         # Longitud promedio de documentos
-
-# Calcular frecuencia de documentos por término (cuántos docs contienen cada término)
-df_term = defaultdict(int)
-for tokens in df['tokens']:
-    for t in set(tokens):
-        df_term[t] += 1
-
-def bm25_score(query_tokens, doc_tokens, k1=1.5, b=0.75):
-    """
-    Calcula el score BM25 entre una consulta y un documento.
-    k1: controla la saturación de la frecuencia del término
-    b: controla la normalización por longitud del documento
-    """
-    score = 0
-    dl = len(doc_tokens)  # Longitud del documento actual
-
-    # Frecuencia de cada término en el documento
-    freq = defaultdict(int)
-    for t in doc_tokens:
-        freq[t] += 1
-
-    for t in query_tokens:
-        if t not in freq:
+    for term in freq_q:
+        postings = inverted_index.get(term)
+        if not postings:
             continue
+        df_t = doc_freq[term]
+        idf  = math.log(1.0 + (N - df_t + 0.5) / (df_t + 0.5))
+        for doc_id, tf in postings.items():
+            dl    = doc_len[doc_id]
+            denom = tf + k1 * (1.0 - b + b * dl / avgdl)
+            scores[doc_id] += idf * (tf * (k1 + 1.0)) / denom
 
-        # IDF: penaliza términos muy comunes en el corpus
-        idf = math.log((N - df_term[t] + 0.5) / (df_term[t] + 0.5) + 1)
+    return sorted(scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
 
-        # TF normalizado por longitud del documento
-        tf = (freq[t] * (k1 + 1)) / (freq[t] + k1 * (1 - b + b * dl / avgdl))
-
-        score += idf * tf
-
-    return score
-
-def search_bm25(query, top_k=10):
-    """
-    Recupera documentos usando el modelo BM25.
-    Retorna los top_k documentos ordenados por score descendente.
-    """
-    query_tokens = preprocess(query)
-
-    # Calcular score BM25 para cada documento del corpus
-    scores = [(i, bm25_score(query_tokens, tokens)) for i, tokens in enumerate(df['tokens'])]
-
-    # Ordenar por score descendente
-    ranked = sorted(scores, key=lambda x: x[1], reverse=True)
-
-    return [(doc_id, score) for doc_id, score in ranked[:top_k] if score > 0]
-
-# ── Modelo Jaccard ─────────────────────────────────────────────────────────────
+# ── Jaccard (candidatos via indice invertido) ─────────────────────────────────
 def search_jaccard(query, top_k=10):
-    """
-    Recupera documentos usando similitud Jaccard.
-    Jaccard = |intersección| / |unión| entre el conjunto de términos
-    de la consulta y el conjunto de términos del documento.
-    """
+    """Jaccard — candidatos del indice invertido, sin fuerza bruta."""
     query_set = set(preprocess(query))
+    if not query_set:
+        return []
+
+    candidates = set()
+    for term in query_set:
+        candidates.update(inverted_index.get(term, {}).keys())
+
     scores = []
+    for doc_id in candidates:
+        doc_set = set(df['tokens'].iloc[doc_id])
+        union   = query_set | doc_set
+        sim     = len(query_set & doc_set) / len(union) if union else 0.0
+        if sim > 0:
+            scores.append((doc_id, sim))
 
-    for i, tokens in enumerate(df['tokens']):
-        doc_set = set(tokens)
-        union = query_set | doc_set
-
-        if union:
-            # Calcular similitud Jaccard
-            similitud = len(query_set & doc_set) / len(union)
-            scores.append((i, similitud))
-
-    # Ordenar por similitud descendente y retornar top_k
     return sorted(scores, key=lambda x: x[1], reverse=True)[:top_k]
 
-# ── Modelo Embeddings ──────────────────────────────────────────────────────────
-from sentence_transformers import SentenceTransformer
-import chromadb
-
-# Cargar modelo preentrenado de sentence-transformers
-embedder = SentenceTransformer('all-MiniLM-L6-v2')
-
-# Inicializar cliente de ChromaDB en memoria
+# ── Embeddings + ChromaDB ─────────────────────────────────────────────────────
+embedder      = SentenceTransformer('all-MiniLM-L6-v2')
 chroma_client = chromadb.Client()
-collection = chroma_client.get_or_create_collection("corpus")
+collection    = chroma_client.get_or_create_collection("corpus")
 
-# Indexar documentos si la colección está vacía
 if collection.count() == 0:
-    print("Indexando embeddings, esto puede tardar unos minutos...")
-    batch = 100  # Procesar en lotes para evitar problemas de memoria
-
-    for i in range(0, len(df), batch):
-        chunk = df['processed'].iloc[i:i+batch].tolist()
-
-        # Generar embeddings normalizados para el lote
+    print("Indexando embeddings (puede tardar ~2 min)...")
+    BATCH = 100
+    for i in range(0, len(df), BATCH):
+        chunk      = df['processed'].iloc[i:i+BATCH].tolist()
         embeddings = embedder.encode(chunk, normalize_embeddings=True).tolist()
-
-        # Agregar a ChromaDB con IDs únicos
         collection.add(
-            documents=chunk,
-            embeddings=embeddings,
-            ids=[str(j) for j in range(i, i+len(chunk))]
+            documents  = chunk,
+            embeddings = embeddings,
+            ids        = [str(j) for j in range(i, i + len(chunk))]
         )
 
 def search_embeddings(query, top_k=10):
-    """
-    Recupera documentos usando búsqueda semántica con embeddings.
-    - Genera el embedding de la consulta
-    - Busca los documentos más cercanos en ChromaDB
-    - Convierte distancia coseno a similitud (1 - distancia)
-    """
-    # Generar embedding de la consulta
-    q_emb = embedder.encode([query], normalize_embeddings=True).tolist()
-
-    # Buscar los top_k documentos más similares en ChromaDB
+    """Busqueda semantica con sentence-transformers + ChromaDB."""
+    q_emb   = embedder.encode([query], normalize_embeddings=True).tolist()
     results = collection.query(query_embeddings=q_emb, n_results=top_k)
-
-    # Convertir IDs y distancias a similitudes
     doc_ids = [int(i) for i in results['ids'][0]]
-    scores = [1 - d for d in results['distances'][0]]
-
+    scores  = [1.0 - d for d in results['distances'][0]]
     return list(zip(doc_ids, scores))
 
-# ── Mostrar resultados ─────────────────────────────────────────────────────────
+# ── Mostrar resultados ────────────────────────────────────────────────────────
 def show_results(ranked_docs, model_name='Modelo', top_n=5):
-    """
-    Imprime los resultados de una búsqueda de forma legible.
-    Muestra el ranking, score, título y un snippet del texto.
-    """
+    """Imprime ranking con score, titulo y snippet."""
     print(f'\n[{model_name}] Top {min(top_n, len(ranked_docs))} resultados')
-
     if not ranked_docs:
-        print('No se encontraron resultados.')
+        print('Sin resultados.')
         return
-
-    for rank, (doc_id, score) in enumerate(ranked_docs[:top_n], start=1):
-        row = df.iloc[doc_id]
-
-        # Obtener título o marcar como sin título
-        title = str(row['title']) if pd.notna(row['title']) else 'Sin título'
-
-        # Limpiar saltos de línea del texto y recortar a 140 caracteres
-        text = str(row['text']).replace('\n', ' ')
+    for rank, (doc_id, score) in enumerate(ranked_docs[:top_n], 1):
+        row     = df.iloc[doc_id]
+        title   = str(row['title']) if pd.notna(row['title']) else 'Sin titulo'
+        text    = str(row['text']).replace('\n', ' ')
         snippet = text[:140] + ('...' if len(text) > 140 else '')
+        print(f"  {rank}. [{score:.4f}] {title}")
+        print(f"     {snippet}\n")
 
-        print(f"{rank}. [{score:.4f}] {title}")
-        print(f"   {snippet}\n")
+# ── Evaluacion ────────────────────────────────────────────────────────────────
+def load_evaluation_files(queries_path, qrels_path):
+    """
+    Lee queries.txt y qrels.txt en formato TREC.
+      queries.txt : '<QID> <texto>'       ej: Q1 oil prices
+      qrels.txt   : '<QID> <doc_id> <1>'  ej: Q1 1331 1
+    Retorna dict: {texto_consulta -> set(doc_ids relevantes)}
+    compatible con evaluar_modelo().
+    """
+    queries = {}
+    with open(queries_path, encoding='utf-8-sig') as f:
+        for line in f:
+            parts = line.strip().split(maxsplit=1)
+            if len(parts) == 2:
+                queries[parts[0]] = parts[1]
+
+    qrels_by_qid = defaultdict(set)
+    with open(qrels_path, encoding='utf-8-sig') as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) >= 2:
+                qrels_by_qid[parts[0]].add(int(parts[1]))
+
+    # Unir: texto_consulta -> set(doc_ids)
+    return {queries[qid]: docs for qid, docs in qrels_by_qid.items() if qid in queries}
+
+def build_qrels(min_docs=2):
+    """
+    Construye qrels desde la columna 'topics' del corpus.
+    Retorna dict: topic -> set de doc_ids relevantes.
+    """
+    qrels = defaultdict(set)
+    for idx in range(len(df)):
+        valor = df.iloc[idx]['topics']
+        if pd.isna(valor):
+            continue
+        for topic in re.findall(r"'([^']+)'", str(valor)):
+            topic = topic.strip()
+            if topic:
+                qrels[topic].add(idx)
+    return {t: docs for t, docs in qrels.items() if len(docs) >= min_docs}
+
+def precision_at_k(ranked, relevant, k):
+    top  = [d for d, _ in ranked[:k]]
+    hits = sum(1 for d in top if d in relevant)
+    return hits / k if k > 0 else 0.0
+
+def recall_at_k(ranked, relevant, k):
+    top  = [d for d, _ in ranked[:k]]
+    hits = sum(1 for d in top if d in relevant)
+    return hits / len(relevant) if relevant else 0.0
+
+def average_precision(ranked, relevant):
+    if not relevant:
+        return 0.0
+    hits, ap = 0, 0.0
+    for rank, (doc_id, _) in enumerate(ranked, 1):
+        if doc_id in relevant:
+            hits += 1
+            ap   += hits / rank
+    return ap / len(relevant)
+
+def evaluar_modelo(search_fn, qrels, k=10):
+    """Evalua un modelo sobre todos los topics. Retorna Precision@k, Recall@k, MAP."""
+    p_list, r_list, ap_list = [], [], []
+    for topic, relevant in qrels.items():
+        ranked = search_fn(topic, top_k=k)
+        p_list.append(precision_at_k(ranked, relevant, k))
+        r_list.append(recall_at_k(ranked, relevant, k))
+        ap_list.append(average_precision(ranked, relevant))
+    return {
+        f'Precision@{k}': round(sum(p_list)  / len(p_list),  4),
+        f'Recall@{k}':    round(sum(r_list)  / len(r_list),  4),
+        'MAP':            round(sum(ap_list) / len(ap_list), 4),
+    }
